@@ -1,14 +1,24 @@
+"""Detection server: POST /predict (menu detection via OpenRouter) and POST /leftover (% of plate left).
+
+/leftover: multipart/form-data `image` (before meal), `leftover_image` (after meal),
+`metadata` (optional JSON from /predict; validated but not yet used).
+"""
+
 import base64
 import json
 import os
 import uuid
 from io import BytesIO
 
+import cv2
+import numpy as np
 import requests
 from flask import Flask, jsonify, request
 from PIL import Image
 
-# API_KEY = os.environ.get("OPENROUTER_API_KEY")
+from pipeline import LeftoverPipeline, UnusableImage
+
+API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 DATA_PATH = "data.json"
 STATIC_DIR = "static"
@@ -140,6 +150,7 @@ def classify(image_path, data_path=DATA_PATH):
 
 app = Flask(__name__)
 os.makedirs(STATIC_DIR, exist_ok=True)
+pipeline = LeftoverPipeline()  # load models once, not per request
 
 
 @app.route('/predict', methods=['POST'])
@@ -178,5 +189,32 @@ def predict():
         return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
 
 
+def read_image(name: str) -> np.ndarray:
+    upload = request.files.get(name)
+    if upload is None:
+        raise KeyError(f"missing file field '{name}'")
+    image = cv2.imdecode(np.frombuffer(upload.read(), dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise UnusableImage(f"'{name}' is not a readable image")
+    return image
+
+
+@app.post("/leftover")
+def leftover():
+    try:
+        raw_metadata = request.form.get("metadata")
+        if raw_metadata:
+            json.loads(raw_metadata)
+        before_img = read_image("image")
+        after_img = read_image("leftover_image")
+        result = pipeline.compare(before_img, after_img)
+    except (KeyError, json.JSONDecodeError) as e:
+        return jsonify(error=str(e.args[0] if isinstance(e, KeyError) else f"metadata is not valid JSON: {e}")), 400
+    except UnusableImage as e:
+        return jsonify(error=str(e)), 422
+    return jsonify(result)
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=6000, debug=True)
+    # debug stays off by default: the reloader would load the models twice and the debugger is unsafe on 0.0.0.0
+    app.run(host="0.0.0.0", port=6000, debug=os.environ.get("FLASK_DEBUG") == "1")
